@@ -1,0 +1,168 @@
+
+const n8nApi = require("../services/n8nApi");
+const { escapeHtml, statusEmoji, formatUptime, progressBar } = require("../utils/format");
+const { exec } = require("child_process");
+
+module.exports = (bot) => {
+
+    // ─── /summary — Quick dashboard overview ───────────
+
+    bot.command("summary", async (ctx) => {
+        try {
+            await ctx.reply("📊 Generating dashboard...");
+
+            const [workflows, execData] = await Promise.all([
+                n8nApi.getAllWorkflows(),
+                n8nApi.getExecutions({ limit: 100 }),
+            ]);
+
+            const executions = execData.data || [];
+            const active = workflows.filter(wf => wf.active).length;
+            const inactive = workflows.length - active;
+
+            const success = executions.filter(e => e.status === "success").length;
+            const failed = executions.filter(e => e.status === "error").length;
+            const running = executions.filter(e => e.status === "running").length;
+            const waiting = executions.filter(e => e.status === "waiting").length;
+
+            const successRate = executions.length > 0
+                ? ((success / executions.length) * 100).toFixed(1)
+                : "0";
+
+            // Find most active workflow
+            const wfCounts = {};
+            executions.forEach(e => {
+                const name = e.workflowData?.name || e.workflowId || "Unknown";
+                wfCounts[name] = (wfCounts[name] || 0) + 1;
+            });
+            const sorted = Object.entries(wfCounts).sort((a, b) => b[1] - a[1]);
+            const topWorkflow = sorted[0] ? `${sorted[0][0]} (${sorted[0][1]} runs)` : "N/A";
+
+            // Last failure
+            const lastFail = executions.find(e => e.status === "error");
+            const lastFailInfo = lastFail
+                ? `${lastFail.workflowData?.name || "?"} — ${new Date(lastFail.startedAt).toLocaleString()}`
+                : "None 🎉";
+
+            // Visual bars
+            const activeBar = progressBar(workflows.length > 0 ? (active / workflows.length) * 100 : 0);
+            const successBar = progressBar(parseFloat(successRate));
+
+            await ctx.reply(
+                [
+                    `📊 <b>n8n Dashboard Summary</b>`,
+                    ``,
+                    `<b>Workflows</b> ${activeBar}`,
+                    `├ Total: <b>${workflows.length}</b>`,
+                    `├ 🟢 Active: <b>${active}</b>`,
+                    `└ 🔴 Inactive: <b>${inactive}</b>`,
+                    ``,
+                    `<b>Executions</b> (last 100) ${successBar}`,
+                    `├ ✅ Success: <b>${success}</b>`,
+                    `├ ❌ Failed: <b>${failed}</b>`,
+                    `├ ⏳ Running: <b>${running}</b>`,
+                    `├ ⏸ Waiting: <b>${waiting}</b>`,
+                    `└ 📈 Success Rate: <b>${successRate}%</b>`,
+                    ``,
+                    `<b>Highlights</b>`,
+                    `├ 🏆 Most Active: ${escapeHtml(topWorkflow)}`,
+                    `└ 💥 Last Failure: ${escapeHtml(lastFailInfo)}`,
+                ].join("\n"),
+                { parse_mode: "HTML" }
+            );
+        } catch (err) {
+            await ctx.reply(`❌ Error: ${err.message}`);
+        }
+    });
+
+    // ─── /version — Show n8n + bot version ─────────────
+
+    bot.command("version", async (ctx) => {
+        try {
+            let n8nVersion = "Unknown";
+            let n8nEdition = "Unknown";
+
+            // Attempt 1: Get version from n8n REST API settings
+            try {
+                const settings = await n8nApi.getSettings();
+                if (settings.versionCli || settings.n8nVersion) {
+                    n8nVersion = settings.versionCli || settings.n8nVersion;
+                }
+                if (settings.license?.planName) {
+                    n8nEdition = settings.license.planName;
+                } else if (settings.enterprise) {
+                    n8nEdition = "Enterprise";
+                } else if (n8nVersion !== "Unknown") {
+                    n8nEdition = "Community";
+                }
+            } catch { }
+
+            // Attempt 2: If API didn't return version, try Docker exec
+            if (n8nVersion === "Unknown") {
+                try {
+                    n8nVersion = await new Promise((resolve, reject) => {
+                        // Find the actual container name dynamically (Docker Compose prefixes it)
+                        const cmd = `CONTAINER=$(docker ps --filter "name=n8n-main" --format "{{.Names}}" | head -1) && docker exec "$CONTAINER" n8n --version 2>/dev/null`;
+                        exec(cmd, { timeout: 15000 }, (err, stdout) => {
+                            if (err) return reject(err);
+                            const ver = (stdout || "").trim();
+                            if (ver) resolve(ver);
+                            else reject(new Error("Empty output"));
+                        });
+                    });
+                    if (n8nEdition === "Unknown") n8nEdition = "Community";
+                } catch { }
+            }
+
+            // Attempt 3: Check Docker image tag as last resort
+            if (n8nVersion === "Unknown") {
+                try {
+                    n8nVersion = await new Promise((resolve, reject) => {
+                        const cmd = `docker ps --filter "name=n8n-main" --format "{{.Image}}" | head -1`;
+                        exec(cmd, { timeout: 10000 }, (err, stdout) => {
+                            if (err) return reject(err);
+                            const image = (stdout || "").trim();
+                            // Extract tag, e.g. "n8nio/n8n:1.70.2" → "1.70.2"
+                            const tag = image.split(":").pop();
+                            if (tag && tag !== image && tag !== "latest") resolve(tag);
+                            else reject(new Error("No useful tag"));
+                        });
+                    });
+                    if (n8nEdition === "Unknown") n8nEdition = "Community";
+                } catch { }
+            }
+
+            // Attempt 4: Read N8N_VERSION from environment (set in docker-compose)
+            if (n8nVersion === "Unknown" && process.env.N8N_VERSION && process.env.N8N_VERSION !== "latest") {
+                n8nVersion = process.env.N8N_VERSION;
+                if (n8nEdition === "Unknown") n8nEdition = "Community";
+            }
+
+            const nodeVersion = process.version;
+            const uptime = formatUptime(process.uptime() * 1000);
+            const memUsage = process.memoryUsage();
+            const heapMB = (memUsage.heapUsed / 1024 / 1024).toFixed(1);
+
+            await ctx.reply(
+                [
+                    `ℹ️ <b>Version Info</b>`,
+                    ``,
+                    `<b>n8n</b>`,
+                    `├ Version: <b>${escapeHtml(n8nVersion)}</b>`,
+                    `└ Edition: ${escapeHtml(n8nEdition)}`,
+                    ``,
+                    `<b>Bot</b>`,
+                    `├ Version: <b>3.0.0</b>`,
+                    `├ Node.js: ${nodeVersion}`,
+                    `├ Memory: ${heapMB} MB`,
+                    `├ Uptime: ${uptime}`,
+                    `└ Commands: <b>50</b>`,
+                ].join("\n"),
+                { parse_mode: "HTML" }
+            );
+        } catch (err) {
+            await ctx.reply(`❌ Error: ${err.message}`);
+        }
+    });
+};
+
